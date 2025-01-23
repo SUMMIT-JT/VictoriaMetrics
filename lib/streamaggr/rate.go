@@ -4,105 +4,105 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 )
 
-func rateInitFn(isAvg bool) aggrValuesFn {
-	return func(v *aggrValues, enableWindows bool) {
-		shared := &rateAggrValueShared{
-			lastValues: make(map[string]rateLastValue),
-		}
-		v.blue = append(v.blue, &rateAggrValue{
-			isAvg:  isAvg,
-			shared: shared,
-			state:  make(map[string]rateAggrValueState),
-		})
-		if enableWindows {
-			v.green = append(v.green, &rateAggrValue{
-				isAvg:  isAvg,
-				shared: shared,
-				state:  make(map[string]rateAggrValueState),
-			})
-		}
-	}
-}
-
-// rateLastValue calculates output=rate_avg and rate_sum, e.g. the average per-second increase rate for counter metrics.
-type rateLastValue struct {
+// rateAggrSharedValue calculates output=rate_avg and rate_sum, e.g. the average per-second increase rate for counter metrics.
+type rateAggrSharedValue struct {
 	value          float64
 	deleteDeadline int64
 
 	// prevTimestamp is the timestamp of the last registered sample in the previous aggregation interval
 	prevTimestamp int64
+	blue          *rateAggrStateValue
+	green         *rateAggrStateValue
 }
 
-type rateAggrValueShared struct {
-	lastValues map[string]rateLastValue
-}
-
-type rateAggrValueState struct {
+type rateAggrStateValue struct {
 	// increase stores cumulative increase for the current time series on the current aggregation interval
 	increase  float64
 	timestamp int64
 }
 
 type rateAggrValue struct {
-	shared *rateAggrValueShared
-	state  map[string]rateAggrValueState
-	isAvg  bool
+	shared  map[string]rateAggrSharedValue
+	isGreen bool
 }
 
-func (av *rateAggrValue) pushSample(inputKey string, sample *pushSample, deleteDeadline int64) {
-	sv := av.state[inputKey]
-	lv, ok := av.shared.lastValues[inputKey]
+func (av *rateAggrValue) pushSample(c aggrConfig, sample *pushSample, key string, deleteDeadline int64) {
+	ac := c.(*rateAggrConfig)
+	var state *rateAggrStateValue
+	sv, ok := av.shared[key]
 	if ok {
-		if sample.timestamp < sv.timestamp {
+		if av.isGreen {
+			state = sv.green
+		} else {
+			state = sv.blue
+		}
+		if sample.timestamp < state.timestamp {
 			// Skip out of order sample
 			return
 		}
-		if sample.value >= lv.value {
-			sv.increase += sample.value - lv.value
+		if sample.value >= sv.value {
+			state.increase += sample.value - sv.value
 		} else {
 			// counter reset
-			sv.increase += sample.value
+			state.increase += sample.value
 		}
 	} else {
-		lv.prevTimestamp = sample.timestamp
+		state = &rateAggrStateValue{}
+		if ac.useSharedState {
+			if av.isGreen {
+				sv.blue = &rateAggrStateValue{}
+			} else {
+				sv.green = &rateAggrStateValue{}
+			}
+		}
+		if av.isGreen {
+			sv.green = state
+		} else {
+			sv.blue = state
+		}
+		sv.prevTimestamp = sample.timestamp
 	}
-	lv.value = sample.value
-	lv.deleteDeadline = deleteDeadline
-	sv.timestamp = sample.timestamp
-	inputKey = bytesutil.InternString(inputKey)
-	av.state[inputKey] = sv
-	av.shared.lastValues[inputKey] = lv
+	sv.value = sample.value
+	sv.deleteDeadline = deleteDeadline
+	state.timestamp = sample.timestamp
+	key = bytesutil.InternString(key)
+	av.shared[key] = sv
 }
 
-func (av *rateAggrValue) flush(ctx *flushCtx, key string) {
-	suffix := av.getSuffix()
+func (av *rateAggrValue) flush(c aggrConfig, ctx *flushCtx, key string) {
+	ac := c.(*rateAggrConfig)
+	var state *rateAggrStateValue
+	suffix := ac.getSuffix()
 	rate := 0.0
 	countSeries := 0
-	lvs := av.shared.lastValues
-	for lk, lv := range lvs {
-		if ctx.flushTimestamp > lv.deleteDeadline {
-			delete(lvs, lk)
+	for sk, sv := range av.shared {
+		if ctx.flushTimestamp > sv.deleteDeadline {
+			delete(av.shared, sk)
 			continue
 		}
-	}
-	for sk, sv := range av.state {
-		lv := lvs[sk]
-		if lv.prevTimestamp == 0 {
+		if sv.prevTimestamp == 0 {
 			continue
 		}
-		d := float64(sv.timestamp-lv.prevTimestamp) / 1000
+		if av.isGreen {
+			state = sv.green
+		} else {
+			state = sv.blue
+		}
+		d := float64(state.timestamp-sv.prevTimestamp) / 1000
 		if d > 0 {
-			rate += sv.increase / d
+			rate += state.increase / d
 			countSeries++
 		}
-		lv.prevTimestamp = sv.timestamp
-		lvs[sk] = lv
-		delete(av.state, sk)
+		sv.prevTimestamp = state.timestamp
+		state.timestamp = 0
+		state.increase = 0
+		av.shared[sk] = sv
 	}
+
 	if countSeries == 0 {
 		return
 	}
-	if av.isAvg {
+	if ac.isAvg {
 		rate /= float64(countSeries)
 	}
 	if rate > 0 {
@@ -110,8 +110,37 @@ func (av *rateAggrValue) flush(ctx *flushCtx, key string) {
 	}
 }
 
-func (av *rateAggrValue) getSuffix() string {
-	if av.isAvg {
+func (av *rateAggrValue) state() any {
+	return av.shared
+}
+
+func newRateAggrConfig(isAvg, useSharedState bool) aggrConfig {
+	return &rateAggrConfig{
+		isAvg:          isAvg,
+		useSharedState: useSharedState,
+	}
+}
+
+type rateAggrConfig struct {
+	isAvg          bool
+	useSharedState bool
+}
+
+func (*rateAggrConfig) getValue(s any) aggrValue {
+	var shared map[string]rateAggrSharedValue
+	if s == nil {
+		shared = make(map[string]rateAggrSharedValue)
+	} else {
+		shared = s.(map[string]rateAggrSharedValue)
+	}
+	return &rateAggrValue{
+		shared:  shared,
+		isGreen: s != nil,
+	}
+}
+
+func (ac *rateAggrConfig) getSuffix() string {
+	if ac.isAvg {
 		return "rate_avg"
 	}
 	return "rate_sum"
