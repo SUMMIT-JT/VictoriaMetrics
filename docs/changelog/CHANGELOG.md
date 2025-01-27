@@ -20,6 +20,8 @@ See also [LTS releases](https://docs.victoriametrics.com/lts-releases/).
 
 * FEATURE: [Single-node VictoriaMetrics](https://docs.victoriametrics.com/) and [vmstorage](https://docs.victoriametrics.com/cluster-victoriametrics/): improve startup times when opening a storage with the [retention](https://docs.victoriametrics.com/#retention) exceeding a few months.
 
+* BUGFIX: [Single-node VictoriaMetrics](https://docs.victoriametrics.com/) and [vmselect](https://docs.victoriametrics.com/cluster-victoriametrics/): fix discrepancies when using `or` binary operator. See [this](https://github.com/VictoriaMetrics/VictoriaMetrics/issues/7759) and [this](https://github.com/VictoriaMetrics/VictoriaMetrics/issues/7640) issues for details.
+
 ## [v1.110.0](https://github.com/VictoriaMetrics/VictoriaMetrics/releases/tag/v1.110.0)
 
 Released at 2025-01-24
